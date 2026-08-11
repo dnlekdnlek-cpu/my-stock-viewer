@@ -4,4 +4,4 @@ numpy
 finance-datareader
 pykrx
 plotly
-setuptools
+setuptools==70.0.0
