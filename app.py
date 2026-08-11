@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 import requests
+from bs4 import BeautifulSoup
 
 # =========================================================
 # pykrx 헤더 패치 (KRX 서버가 클라우드 요청을 봇으로 오인해 403 반환하는 문제 완화)
@@ -52,9 +53,7 @@ def get_krx_ticker_list():
 
 
 def fetch_with_retry(fetch_func, max_retry=3, delay=1.5):
-    """
-    일시적인 403/타임아웃에 대응하기 위해 짧은 대기 후 재시도.
-    """
+    """일시적인 403/타임아웃에 대응하기 위해 짧은 대기 후 재시도."""
     for attempt in range(max_retry):
         try:
             df = fetch_func()
@@ -67,10 +66,7 @@ def fetch_with_retry(fetch_func, max_retry=3, delay=1.5):
 
 
 def get_latest_valid_date(fetch_func, max_lookback=10):
-    """
-    fetch_func: 특정 날짜(YYYYMMDD)를 인자로 받아 DataFrame을 반환하는 함수
-    빈 DataFrame이 아닌 결과가 나올 때까지 하루씩 뒤로 조회 + 재시도 결합
-    """
+    """빈 DataFrame이 아닌 결과가 나올 때까지 하루씩 뒤로 조회 + 재시도 결합"""
     for i in range(max_lookback):
         target_date = (datetime.today() - timedelta(days=i)).strftime("%Y%m%d")
         df = fetch_with_retry(lambda: fetch_func(target_date))
@@ -80,7 +76,7 @@ def get_latest_valid_date(fetch_func, max_lookback=10):
 
 
 # =========================================================
-# 네이버 금융 폴백 (pykrx가 완전히 막혔을 때 최종 안전망)
+# 네이버 금융 폴백 (BeautifulSoup 고정 id 기반 — read_html보다 안정적)
 # =========================================================
 def fetch_fundamental_naver_fallback(ticker_code):
     try:
@@ -88,14 +84,41 @@ def fetch_fundamental_naver_fallback(ticker_code):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         res = requests.get(url, headers=headers, timeout=5)
         res.encoding = "euc-kr"
-        tables = pd.read_html(res.text)
+        soup = BeautifulSoup(res.text, "html.parser")
 
-        # 네이버 페이지 구조상 PER/PBR 정보가 포함된 테이블 탐색
-        for t in tables:
-            cols = [str(c) for c in t.columns]
-            if any("PER" in c for c in cols) or (t.astype(str).apply(lambda x: x.str.contains("PER", na=False)).any().any()):
-                return t
-        return None
+        def get_value(css_id):
+            tag = soup.select_one(f"em#{css_id}")
+            if tag:
+                text = tag.get_text(strip=True).replace(",", "")
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+            return None
+
+        per = get_value("_per")
+        eps = get_value("_eps")
+        pbr = get_value("_pbr")
+        bps = get_value("_bps")
+
+        div_yield = None
+        for tr in soup.select("table tr"):
+            header_cell = tr.find(["th", "td"])
+            if header_cell and "배당수익률" in header_cell.get_text():
+                tds = tr.find_all("td")
+                if tds:
+                    val = tds[0].get_text(strip=True).replace("%", "")
+                    try:
+                        div_yield = float(val)
+                    except ValueError:
+                        div_yield = None
+                break
+
+        if per is None and pbr is None and eps is None:
+            return None
+
+        return {"PER": per, "PBR": pbr, "EPS": eps, "BPS": bps, "DIV": div_yield}
+
     except Exception as e:
         print(f"네이버 폴백 실패: {e}")
         return None
@@ -122,7 +145,7 @@ def fetch_top10():
 
 
 # =========================================================
-# 투자 지표 (PER, PBR, EPS, 배당수익률)
+# 투자 지표 (PER, PBR, EPS, 배당수익률) — pykrx 우선, 실패 시 네이버 폴백
 # =========================================================
 @st.cache_data(ttl=1800)
 def fetch_fundamental(ticker_code):
@@ -131,12 +154,11 @@ def fetch_fundamental(ticker_code):
 
     df, used_date = get_latest_valid_date(_fetch)
     if not df.empty and ticker_code in df.index:
-        return df.loc[ticker_code], used_date, "pykrx"
+        return df.loc[ticker_code].to_dict(), used_date, "pykrx"
 
-    # pykrx가 계속 실패하면 네이버 폴백 시도
     fallback = fetch_fundamental_naver_fallback(ticker_code)
     if fallback is not None:
-        return fallback, "실시간(네이버)", "naver"
+        return fallback, "실시간", "naver"
 
     return None, None, None
 
@@ -191,7 +213,7 @@ with st.sidebar:
 
 
 # =========================================================
-# 메인 화면: 종목 검색
+# 메인 화면: 종목 검색 (정확히 일치하는 종목 최우선 정렬)
 # =========================================================
 st.title("📈 주식 지표 분석기")
 
@@ -205,7 +227,10 @@ search_name = st.text_input(
 selected_code = st.session_state.get("selected_code", None)
 
 if search_name:
-    matched = ticker_list[ticker_list["Name"].str.contains(search_name, case=False, na=False)]
+    exact = ticker_list[ticker_list["Name"] == search_name]
+    contains = ticker_list[ticker_list["Name"].str.contains(search_name, case=False, na=False)]
+    matched = pd.concat([exact, contains]).drop_duplicates(subset="Code").reset_index(drop=True)
+
     if not matched.empty:
         options = matched["Name"] + " (" + matched["Code"] + ")"
         choice = st.selectbox("검색 결과에서 종목을 선택하세요", options)
@@ -259,17 +284,19 @@ if selected_code:
         if fundamental is None:
             st.info("투자 지표 데이터를 불러올 수 없습니다. (휴장일이거나 데이터 미제공 종목)")
         else:
-            badge = "pykrx" if source == "pykrx" else "네이버 폴백"
+            badge = "pykrx" if source == "pykrx" else "네이버 실시간"
             st.caption(f"✅ {fund_date} 기준 · 출처: {badge}")
 
-            if source == "pykrx":
-                fcol1, fcol2, fcol3, fcol4 = st.columns(4)
-                fcol1.metric("PER", f"{fundamental.get('PER', 0):.2f}")
-                fcol2.metric("PBR", f"{fundamental.get('PBR', 0):.2f}")
-                fcol3.metric("EPS", f"{fundamental.get('EPS', 0):,.0f}")
-                fcol4.metric("배당수익률", f"{fundamental.get('DIV', 0):.2f}%")
-            else:
-                st.dataframe(fundamental, use_container_width=True)
+            fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+            per_val = fundamental.get("PER")
+            pbr_val = fundamental.get("PBR")
+            eps_val = fundamental.get("EPS")
+            div_val = fundamental.get("DIV")
+
+            fcol1.metric("PER", f"{per_val:.2f}" if per_val is not None else "N/A")
+            fcol2.metric("PBR", f"{pbr_val:.2f}" if pbr_val is not None else "N/A")
+            fcol3.metric("EPS", f"{eps_val:,.0f}" if eps_val is not None else "N/A")
+            fcol4.metric("배당수익률", f"{div_val:.2f}%" if div_val is not None else "N/A")
 
         st.markdown("---")
 
