@@ -1,6 +1,6 @@
-streamlit==1.38.0
-pandas==2.1.4
-numpy==1.26.4
-plotly==5.24.1
+streamlit
+pandas
+numpy
 FinanceDataReader
 pykrx
+plotly
