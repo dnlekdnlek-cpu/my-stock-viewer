@@ -1,7 +1,7 @@
-streamlit>=1.38,<2
+streamlit
 streamlit-autorefresh
-pandas>=2.0,<3
-numpy>=1.26,<2
+pandas
+numpy
 plotly
 finance-datareader
 pykrx
