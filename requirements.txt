@@ -1,8 +1,9 @@
-streamlit
-streamlit-autorefresh
-pandas
-numpy
-plotly
-finance-datareader
-pykrx
-pytz
+setuptools>=68.0.0
+streamlit==1.61.1
+streamlit-autorefresh==1.0.1
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.24.1
+FinanceDataReader==0.9.90
+pykrx==1.0.51
+pytz==2024.1
