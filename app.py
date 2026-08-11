@@ -63,37 +63,69 @@ def get_last_trading_day():
 last_trading_day = get_last_trading_day()
 
 # ==========================================================
-# 3. 종목 리스트 (검색용) - 하루 캐시
+# 3. 종목 리스트 (검색용) - pykrx 우선, FDR 백업, 하루 캐시
 # ==========================================================
 @st.cache_data(ttl=60 * 60 * 24)
 def load_stock_list():
-    df = fdr.StockListing('KRX')
-    df = df[['Code', 'Name']].dropna()
-    return df
+    # 1차 시도: pykrx
+    try:
+        tickers_kospi = stock.get_market_ticker_list(market="KOSPI")
+        tickers_kosdaq = stock.get_market_ticker_list(market="KOSDAQ")
+        all_tickers = tickers_kospi + tickers_kosdaq
+
+        names = []
+        for code in all_tickers:
+            try:
+                name = stock.get_market_ticker_name(code)
+                names.append({"Code": code, "Name": name})
+            except Exception:
+                continue
+
+        df = pd.DataFrame(names)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # 2차 시도(백업): FinanceDataReader
+    try:
+        df = fdr.StockListing('KRX')
+        df = df[['Code', 'Name']].dropna()
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["Code", "Name"])
 
 stock_list = load_stock_list()
+
+if stock_list.empty:
+    st.error("⚠️ 종목 리스트를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
+    st.stop()
+
 name_to_code = dict(zip(stock_list['Name'], stock_list['Code']))
 
 # ==========================================================
 # 4. 인기 종목 TOP10 (거래대금 기준) - 장중만 실시간, 마감후 고정
 # ==========================================================
 def fetch_top10():
-    df = stock.get_market_ohlcv_by_ticker(last_trading_day, market="ALL")
-    df = df.sort_values(by="거래대금", ascending=False).head(10)
-    result = []
-    for code in df.index:
-        try:
-            name = stock.get_market_ticker_name(code)
-        except Exception:
-            name = code
-        result.append({
-            "코드": code,
-            "종목명": name,
-            "종가": df.loc[code, "종가"],
-            "등락률": df.loc[code, "등락률"],
-            "거래대금": df.loc[code, "거래대금"]
-        })
-    return pd.DataFrame(result)
+    try:
+        df = stock.get_market_ohlcv_by_ticker(last_trading_day, market="ALL")
+        df = df.sort_values(by="거래대금", ascending=False).head(10)
+        result = []
+        for code in df.index:
+            try:
+                name = stock.get_market_ticker_name(code)
+            except Exception:
+                name = code
+            result.append({
+                "코드": code,
+                "종목명": name,
+                "종가": df.loc[code, "종가"],
+                "등락률": df.loc[code, "등락률"],
+                "거래대금": df.loc[code, "거래대금"]
+            })
+        return pd.DataFrame(result)
+    except Exception:
+        return pd.DataFrame(columns=["코드", "종목명", "종가", "등락률", "거래대금"])
 
 if is_market_open:
     top10_df = fetch_top10()
@@ -113,11 +145,13 @@ st.sidebar.header("🔥 실시간 인기 종목 TOP 10")
 st.sidebar.caption("거래대금 기준")
 
 selected_from_sidebar = None
-for i, row in top10_df.iterrows():
-    color = "red" if row["등락률"] > 0 else ("blue" if row["등락률"] < 0 else "black")
-    label = f"{row['종목명']} ({row['등락률']:+.2f}%)"
-    if st.sidebar.button(label, key=f"top10_{i}"):
-        selected_from_sidebar = row["종목명"]
+if not top10_df.empty:
+    for i, row in top10_df.iterrows():
+        label = f"{row['종목명']} ({row['등락률']:+.2f}%)"
+        if st.sidebar.button(label, key=f"top10_{i}"):
+            selected_from_sidebar = row["종목명"]
+else:
+    st.sidebar.warning("인기 종목 데이터를 불러오지 못했습니다.")
 
 # ==========================================================
 # 6. 종목 검색창
@@ -145,8 +179,11 @@ st.markdown(f"### {search_name} ({ticker})")
 # ==========================================================
 def fetch_ohlcv(ticker):
     start_date = (now - timedelta(days=200)).strftime('%Y-%m-%d')
-    df = fdr.DataReader(ticker, start_date)
-    return df
+    try:
+        df = fdr.DataReader(ticker, start_date)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 def get_ohlcv_cached(ticker):
     key = f"{ticker}_{today_str}"
@@ -244,7 +281,6 @@ fig = make_subplots(
     subplot_titles=("가격 & 이동평균선", "RSI(14)", "MACD")
 )
 
-# --- 캔들차트 ---
 fig.add_trace(go.Candlestick(
     x=df.index, open=df['Open'], high=df['High'],
     low=df['Low'], close=df['Close'], name="캔들"
@@ -255,12 +291,10 @@ for ma, color in [("MA5", "orange"), ("MA20", "green"), ("MA60", "purple")]:
         x=df.index, y=df[ma], mode='lines', name=ma, line=dict(width=1.3, color=color)
     ), row=1, col=1)
 
-# --- RSI ---
 fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='blue', width=1.3), name="RSI"), row=2, col=1)
 fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
 fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
 
-# --- MACD ---
 fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], line=dict(color='blue', width=1.2), name="MACD"), row=3, col=1)
 fig.add_trace(go.Scatter(x=df.index, y=df['MACD_signal'], line=dict(color='red', width=1.2), name="Signal"), row=3, col=1)
 colors = ['red' if v >= 0 else 'blue' for v in df['MACD_hist']]
