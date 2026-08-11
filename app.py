@@ -6,13 +6,38 @@ from pykrx import stock
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import time
+import requests
+
+# =========================================================
+# pykrx 헤더 패치 (KRX 서버가 클라우드 요청을 봇으로 오인해 403 반환하는 문제 완화)
+# =========================================================
+def patch_pykrx_headers():
+    try:
+        from pykrx.website.comm.webio import Get
+        original_init = Get.__init__
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/124.0.0.0 Safari/537.36",
+                "Referer": "https://data.krx.co.kr/"
+            })
+        Get.__init__ = patched_init
+    except Exception as e:
+        print(f"pykrx 헤더 패치 실패: {e}")
+
+patch_pykrx_headers()
+
 
 # =========================================================
 # 기본 설정
 # =========================================================
 st.set_page_config(page_title="주식 지표 분석기", layout="wide")
 
-MARKET = "KOSPI"  # 필요시 "ALL"로 변경 가능 (KOSPI+KOSDAQ)
+MARKET = "ALL"  # KOSPI+KOSDAQ 전체 대상
 
 
 # =========================================================
@@ -26,20 +51,54 @@ def get_krx_ticker_list():
     return df
 
 
+def fetch_with_retry(fetch_func, max_retry=3, delay=1.5):
+    """
+    일시적인 403/타임아웃에 대응하기 위해 짧은 대기 후 재시도.
+    """
+    for attempt in range(max_retry):
+        try:
+            df = fetch_func()
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            print(f"시도 {attempt+1}/{max_retry} 실패: {e}")
+        time.sleep(delay)
+    return pd.DataFrame()
+
+
 def get_latest_valid_date(fetch_func, max_lookback=10):
     """
     fetch_func: 특정 날짜(YYYYMMDD)를 인자로 받아 DataFrame을 반환하는 함수
-    빈 DataFrame이 아닌 결과가 나올 때까지 하루씩 뒤로 조회
+    빈 DataFrame이 아닌 결과가 나올 때까지 하루씩 뒤로 조회 + 재시도 결합
     """
     for i in range(max_lookback):
         target_date = (datetime.today() - timedelta(days=i)).strftime("%Y%m%d")
-        try:
-            df = fetch_func(target_date)
-            if df is not None and not df.empty:
-                return df, target_date
-        except Exception:
-            continue
+        df = fetch_with_retry(lambda: fetch_func(target_date))
+        if not df.empty:
+            return df, target_date
     return pd.DataFrame(), None
+
+
+# =========================================================
+# 네이버 금융 폴백 (pykrx가 완전히 막혔을 때 최종 안전망)
+# =========================================================
+def fetch_fundamental_naver_fallback(ticker_code):
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={ticker_code}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, timeout=5)
+        res.encoding = "euc-kr"
+        tables = pd.read_html(res.text)
+
+        # 네이버 페이지 구조상 PER/PBR 정보가 포함된 테이블 탐색
+        for t in tables:
+            cols = [str(c) for c in t.columns]
+            if any("PER" in c for c in cols) or (t.astype(str).apply(lambda x: x.str.contains("PER", na=False)).any().any()):
+                return t
+        return None
+    except Exception as e:
+        print(f"네이버 폴백 실패: {e}")
+        return None
 
 
 # =========================================================
@@ -48,8 +107,7 @@ def get_latest_valid_date(fetch_func, max_lookback=10):
 @st.cache_data(ttl=1800)
 def fetch_top10():
     def _fetch(date):
-        df = stock.get_market_ohlcv_by_ticker(date, market=MARKET)
-        return df
+        return stock.get_market_ohlcv_by_ticker(date, market=MARKET)
 
     df, used_date = get_latest_valid_date(_fetch)
     if df.empty:
@@ -69,14 +127,18 @@ def fetch_top10():
 @st.cache_data(ttl=1800)
 def fetch_fundamental(ticker_code):
     def _fetch(date):
-        df = stock.get_market_fundamental_by_ticker(date, market=MARKET)
-        return df
+        return stock.get_market_fundamental_by_ticker(date, market=MARKET)
 
     df, used_date = get_latest_valid_date(_fetch)
-    if df.empty or ticker_code not in df.index:
-        return None, used_date
+    if not df.empty and ticker_code in df.index:
+        return df.loc[ticker_code], used_date, "pykrx"
 
-    return df.loc[ticker_code], used_date
+    # pykrx가 계속 실패하면 네이버 폴백 시도
+    fallback = fetch_fundamental_naver_fallback(ticker_code)
+    if fallback is not None:
+        return fallback, "실시간(네이버)", "naver"
+
+    return None, None, None
 
 
 # =========================================================
@@ -88,7 +150,6 @@ def calc_indicators(df):
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
 
-    # RSI (14일)
     delta = df["Close"].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -97,7 +158,6 @@ def calc_indicators(df):
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD (12, 26, 9)
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
@@ -165,7 +225,6 @@ if selected_code:
     name = st.session_state.get("selected_name", selected_code)
     st.header(f"{name} ({selected_code})")
 
-    # ---- 가격 데이터 조회 (1년치) ----
     end_date = datetime.today()
     start_date = end_date - timedelta(days=365)
 
@@ -185,7 +244,6 @@ if selected_code:
         change = latest["Close"] - prev["Close"]
         change_pct = (change / prev["Close"]) * 100 if prev["Close"] else 0
 
-        # ---- 상단 요약 지표 ----
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("현재가", f"{latest['Close']:,.0f} 원", f"{change:+,.0f} ({change_pct:+.2f}%)")
         col2.metric("거래량", f"{latest['Volume']:,.0f}")
@@ -196,17 +254,22 @@ if selected_code:
 
         # ---- 투자 지표 ----
         st.subheader("💰 투자 지표")
-        fundamental, fund_date = fetch_fundamental(selected_code)
+        fundamental, fund_date, source = fetch_fundamental(selected_code)
 
         if fundamental is None:
             st.info("투자 지표 데이터를 불러올 수 없습니다. (휴장일이거나 데이터 미제공 종목)")
         else:
-            st.caption(f"✅ {fund_date} 기준")
-            fcol1, fcol2, fcol3, fcol4 = st.columns(4)
-            fcol1.metric("PER", f"{fundamental.get('PER', 0):.2f}")
-            fcol2.metric("PBR", f"{fundamental.get('PBR', 0):.2f}")
-            fcol3.metric("EPS", f"{fundamental.get('EPS', 0):,.0f}")
-            fcol4.metric("배당수익률", f"{fundamental.get('DIV', 0):.2f}%")
+            badge = "pykrx" if source == "pykrx" else "네이버 폴백"
+            st.caption(f"✅ {fund_date} 기준 · 출처: {badge}")
+
+            if source == "pykrx":
+                fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+                fcol1.metric("PER", f"{fundamental.get('PER', 0):.2f}")
+                fcol2.metric("PBR", f"{fundamental.get('PBR', 0):.2f}")
+                fcol3.metric("EPS", f"{fundamental.get('EPS', 0):,.0f}")
+                fcol4.metric("배당수익률", f"{fundamental.get('DIV', 0):.2f}%")
+            else:
+                st.dataframe(fundamental, use_container_width=True)
 
         st.markdown("---")
 
@@ -221,7 +284,6 @@ if selected_code:
             subplot_titles=(f"{name} 캔들차트 & 이동평균선", "RSI (14)", "MACD")
         )
 
-        # 캔들차트 + 이동평균선
         fig.add_trace(go.Candlestick(
             x=price_df.index, open=price_df["Open"], high=price_df["High"],
             low=price_df["Low"], close=price_df["Close"], name="캔들"
@@ -234,13 +296,11 @@ if selected_code:
         fig.add_trace(go.Scatter(x=price_df.index, y=price_df["MA60"], name="MA60",
                                   line=dict(color="purple", width=1)), row=1, col=1)
 
-        # RSI
         fig.add_trace(go.Scatter(x=price_df.index, y=price_df["RSI"], name="RSI",
                                   line=dict(color="green", width=1)), row=2, col=1)
         fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
         fig.add_hline(y=30, line_dash="dash", line_color="blue", row=2, col=1)
 
-        # MACD
         fig.add_trace(go.Bar(x=price_df.index, y=price_df["Histogram"], name="Histogram",
                               marker_color="gray"), row=3, col=1)
         fig.add_trace(go.Scatter(x=price_df.index, y=price_df["MACD"], name="MACD",
