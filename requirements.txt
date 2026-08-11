@@ -4,3 +4,4 @@ numpy
 finance-datareader
 pykrx
 plotly
+setuptools
