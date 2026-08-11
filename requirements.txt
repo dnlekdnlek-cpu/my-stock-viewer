@@ -1,7 +1,6 @@
 streamlit
 pandas
 numpy
-finance-datareader
+FinanceDataReader
 pykrx
 plotly
-setuptools==70.0.0
