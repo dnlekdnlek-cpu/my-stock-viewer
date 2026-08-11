@@ -4,6 +4,6 @@ streamlit-autorefresh==1.0.1
 pandas==2.2.2
 numpy==1.26.4
 plotly==5.24.1
-FinanceDataReader==0.9.90
+finance-datareader==0.9.94
 pykrx==1.0.51
 pytz==2024.1
