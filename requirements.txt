@@ -1,4 +1,4 @@
-setuptools>=68.0.0
+setuptools<81
 streamlit==1.61.1
 streamlit-autorefresh==1.0.1
 pandas==2.2.2
