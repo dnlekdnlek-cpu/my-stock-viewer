@@ -56,7 +56,57 @@ COMMON_HEADERS = {
 }
 
 # ==========================================================
-# 3. 최근 거래일 구하기
+# 3. ETF / ETN 필터링 유틸
+# ==========================================================
+ETF_NAME_PREFIXES = [
+    "KODEX", "TIGER", "KBSTAR", "ARIRANG", "KINDEX", "HANARO",
+    "SOL", "ACE", "KOSEF", "TIMEFOLIO", "마이다스", "파워",
+    "흥국", "신한", "KTOP", "FOCUS", "대신343", "키움", "유리",
+    "히어로즈", "네비게이터", "웰스", "1Q", "KOAX", "마이티", "우리",
+]
+
+ETF_NAME_KEYWORDS = ["ETN", "ETF", "레버리지", "인버스", "선물", "합성"]
+
+
+def is_etf_like(name: str) -> bool:
+    """종목명 패턴으로 ETF/ETN 여부를 추정 (백업용)"""
+    if not name:
+        return False
+    upper_name = name.upper()
+    for prefix in ETF_NAME_PREFIXES:
+        if upper_name.startswith(prefix.upper()):
+            return True
+    for kw in ETF_NAME_KEYWORDS:
+        if kw in name:
+            return True
+    return False
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def get_etf_code_set():
+    """pykrx 기준 실제 ETF 종목코드 전체 (가장 신뢰도 높은 필터)"""
+    try:
+        codes = stock.get_etf_ticker_list()
+        return set(codes)
+    except Exception:
+        return set()
+
+
+ETF_CODE_SET = get_etf_code_set()
+
+
+def filter_out_etf_df(df: pd.DataFrame, code_col="Code", name_col="Name") -> pd.DataFrame:
+    """코드+이름 이중 필터로 ETF/ETN 제외"""
+    if df is None or df.empty:
+        return df
+    mask = pd.Series(True, index=df.index)
+    if ETF_CODE_SET:
+        mask &= ~df[code_col].isin(ETF_CODE_SET)
+    mask &= ~df[name_col].apply(is_etf_like)
+    return df[mask]
+
+# ==========================================================
+# 4. 최근 거래일 구하기
 # ==========================================================
 def get_last_trading_day():
     d = now
@@ -74,7 +124,8 @@ def get_last_trading_day():
 last_trading_day = get_last_trading_day()
 
 # ==========================================================
-# 4. 종목 리스트 (검색용) - 네이버 크롤링 우선, pykrx/fdr 백업
+# 5. 종목 리스트 (검색용) - 네이버 크롤링 우선, pykrx/fdr 백업
+#    ※ ETF/ETN 제외하여 개별 종목만 남김
 # ==========================================================
 @st.cache_data(ttl=60 * 60 * 24)
 def load_stock_list():
@@ -100,6 +151,7 @@ def load_stock_list():
                 if page > 40:
                     break
         df = pd.DataFrame(all_rows).drop_duplicates(subset="Code")
+        df = filter_out_etf_df(df)
         if not df.empty:
             return df
     except Exception:
@@ -117,6 +169,7 @@ def load_stock_list():
             except Exception:
                 continue
         df = pd.DataFrame(names)
+        df = filter_out_etf_df(df)
         if not df.empty:
             return df
     except Exception:
@@ -125,6 +178,7 @@ def load_stock_list():
     try:
         df = fdr.StockListing('KRX')
         df = df[['Code', 'Name']].dropna()
+        df = filter_out_etf_df(df)
         return df
     except Exception:
         return pd.DataFrame(columns=["Code", "Name"])
@@ -138,15 +192,17 @@ if stock_list.empty:
 name_to_code = dict(zip(stock_list['Name'], stock_list['Code']))
 
 # ==========================================================
-# 5. 인기 종목 TOP10 (거래대금 기준)
+# 6. 인기 종목 TOP10 (거래대금 기준, 개별 종목만)
 #    - 1차: pykrx
-#    - 2차: 네이버 "거래대금 상위" 전용 페이지 (이미 정렬되어 있음)
+#    - 2차: 네이버 "거래대금 상위" 전용 페이지
 # ==========================================================
 @st.cache_data(ttl=25)
 def fetch_top10():
     # 1차: pykrx
     try:
         df = stock.get_market_ohlcv_by_ticker(last_trading_day, market="ALL")
+        if ETF_CODE_SET:
+            df = df[~df.index.isin(ETF_CODE_SET)]
         df = df.sort_values(by="거래대금", ascending=False).head(10)
         result = []
         for code in df.index:
@@ -154,6 +210,8 @@ def fetch_top10():
                 name = stock.get_market_ticker_name(code)
             except Exception:
                 name = code
+            if is_etf_like(name):
+                continue
             result.append({
                 "코드": code,
                 "종목명": name,
@@ -163,7 +221,7 @@ def fetch_top10():
             })
         res_df = pd.DataFrame(result)
         if not res_df.empty:
-            return res_df
+            return res_df.head(10)
     except Exception:
         pass
 
@@ -193,6 +251,13 @@ def fetch_top10():
 
             code = href.split("code=")[-1]
             name = link.text.strip()
+
+            # ETF/ETN 제외 필터 적용
+            if ETF_CODE_SET and code in ETF_CODE_SET:
+                continue
+            if is_etf_like(name):
+                continue
+
             tds = tr.select("td")
 
             try:
@@ -233,10 +298,10 @@ else:
         st.session_state.frozen_top10 = top10_df
 
 # ==========================================================
-# 6. 사이드바 - 인기 종목 TOP10 표시
+# 7. 사이드바 - 인기 종목 TOP10 표시
 # ==========================================================
 st.sidebar.header("🔥 실시간 인기 종목 TOP 10")
-st.sidebar.caption("거래대금 기준")
+st.sidebar.caption("거래대금 기준 · 개별 종목만 (ETF/ETN 제외)")
 
 selected_from_sidebar = None
 if not top10_df.empty:
@@ -248,7 +313,7 @@ else:
     st.sidebar.warning("인기 종목 데이터를 불러오지 못했습니다.")
 
 # ==========================================================
-# 7. 종목 검색창
+# 8. 종목 검색창
 # ==========================================================
 st.subheader("🔍 종목 검색")
 default_value = selected_from_sidebar if selected_from_sidebar else ""
@@ -269,7 +334,7 @@ ticker = name_to_code[search_name]
 st.markdown(f"### {search_name} ({ticker})")
 
 # ==========================================================
-# 8. 시세 데이터 가져오기
+# 9. 시세 데이터 가져오기
 # ==========================================================
 def fetch_ohlcv(ticker):
     start_date = (now - timedelta(days=200)).strftime('%Y-%m-%d')
@@ -298,7 +363,7 @@ if df is None or df.empty:
     st.stop()
 
 # ==========================================================
-# 9. 기술적 지표 계산
+# 10. 기술적 지표 계산
 # ==========================================================
 def calc_moving_averages(df):
     df['MA5'] = df['Close'].rolling(5).mean()
@@ -329,7 +394,7 @@ df = calc_rsi(df)
 df = calc_macd(df)
 
 # ==========================================================
-# 10. 투자 지표 (PER, PBR, EPS, 배당수익률)
+# 11. 투자 지표 (PER, PBR, EPS, 배당수익률)
 # ==========================================================
 def extract_naver_dividend(soup):
     try:
@@ -387,7 +452,7 @@ def get_fundamental(ticker, date):
 fundamental = get_fundamental(ticker, last_trading_day)
 
 # ==========================================================
-# 11. 현재가 / 등락률 요약
+# 12. 현재가 / 등락률 요약
 # ==========================================================
 last_row = df.iloc[-1]
 prev_close = df.iloc[-2]['Close'] if len(df) > 1 else last_row['Close']
@@ -403,7 +468,7 @@ col5.metric("배당수익률", f"{fundamental['DIV']:.2f}%" if fundamental['DIV'
 col6.metric("RSI(14)", f"{last_row['RSI']:.1f}" if not pd.isna(last_row['RSI']) else "N/A")
 
 # ==========================================================
-# 12. 캔들차트 + MA + RSI + MACD
+# 13. 캔들차트 + MA + RSI + MACD
 # ==========================================================
 fig = make_subplots(
     rows=3, cols=1, shared_xaxes=True,
@@ -441,7 +506,7 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================================
-# 13. 하단 데이터 테이블
+# 14. 하단 데이터 테이블
 # ==========================================================
 with st.expander("📋 최근 10일 상세 데이터 보기"):
     st.dataframe(
@@ -450,7 +515,7 @@ with st.expander("📋 최근 10일 상세 데이터 보기"):
     )
 
 # ==========================================================
-# 14. 하단 안내문
+# 15. 하단 안내문
 # ==========================================================
 st.markdown("---")
 st.caption("데이터 출처: 네이버 금융, FinanceDataReader, pykrx (지연 가능성 있음) · 본 정보는 투자 참고용으로만 활용하시기 바랍니다.")
