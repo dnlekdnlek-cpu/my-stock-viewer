@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 import FinanceDataReader as fdr
 from pykrx import stock
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
@@ -46,13 +47,13 @@ else:
     st.sidebar.info(f"🔴 장 마감 · 마감 데이터 고정 표시 ({now.strftime('%H:%M:%S')})")
 
 # ==========================================================
-# 2. KRX 요청 공통 헤더 (차단 우회용)
+# 2. 공통 요청 헤더 (차단 우회용)
 # ==========================================================
-KRX_HEADERS = {
+COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+    "Referer": "https://finance.naver.com/",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
@@ -75,26 +76,38 @@ def get_last_trading_day():
 last_trading_day = get_last_trading_day()
 
 # ==========================================================
-# 4. 종목 리스트 (검색용) - KRX 직접 요청 우선, pykrx 백업, 하루 캐시
+# 4. 종목 리스트 (검색용) - 네이버 금융 크롤링 우선, pykrx 백업, 하루 캐시
 # ==========================================================
 @st.cache_data(ttl=60 * 60 * 24)
 def load_stock_list():
-    # 1차 시도: KRX 서버에 직접 HTTP 요청 (헤더 위장)
+    all_rows = []
+
+    # 1차 시도: 네이버 금융 시세 페이지 크롤링 (0: 코스피, 1: 코스닥)
     try:
-        url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
-        payload = {
-            "bld": "dbms/MDC/STAT/standard/MDCSTAT01901",
-            "mktId": "ALL",
-            "share": "1",
-            "csvxls_isNo": "false",
-        }
-        res = requests.post(url, headers=KRX_HEADERS, data=payload, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        rows = data.get("OutBlock_1", [])
-        df = pd.DataFrame(rows)
-        df = df.rename(columns={"ISU_SRT_CD": "Code", "ISU_ABBRV": "Name"})
-        df = df[["Code", "Name"]].dropna()
+        for sosok in [0, 1]:
+            page = 1
+            while True:
+                url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+                res = requests.get(url, headers=COMMON_HEADERS, timeout=10)
+                res.raise_for_status()
+                soup = BeautifulSoup(res.text, "html.parser")
+                links = soup.select("a.tltle")
+
+                if not links:
+                    break
+
+                for l in links:
+                    href = l.get("href", "")
+                    if "code=" in href:
+                        code = href.split("code=")[-1]
+                        name = l.text.strip()
+                        all_rows.append({"Code": code, "Name": name})
+
+                page += 1
+                if page > 40:  # 안전장치 (무한루프 방지)
+                    break
+
+        df = pd.DataFrame(all_rows).drop_duplicates(subset="Code")
         if not df.empty:
             return df
     except Exception:
@@ -271,19 +284,44 @@ df = calc_macd(df)
 # ==========================================================
 @st.cache_data(ttl=60 * 30)
 def get_fundamental(ticker, date):
+    # 1차: pykrx
     try:
         fdf = stock.get_market_fundamental_by_ticker(date, market="ALL")
         if ticker in fdf.index:
             row = fdf.loc[ticker]
-            return {
-                "PER": row.get("PER", None),
-                "PBR": row.get("PBR", None),
-                "EPS": row.get("EPS", None),
-                "DIV": row.get("DIV", None)
-            }
+            per = row.get("PER", None)
+            pbr = row.get("PBR", None)
+            eps = row.get("EPS", None)
+            div = row.get("DIV", None)
+            if per or pbr or eps or div:
+                return {"PER": per, "PBR": pbr, "EPS": eps, "DIV": div}
     except Exception:
         pass
-    return {"PER": None, "PBR": None, "EPS": None, "DIV": None}
+
+    # 2차 백업: 네이버 금융 종목 페이지 크롤링
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={ticker}"
+        res = requests.get(url, headers=COMMON_HEADERS, timeout=10)
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        def extract_value(em_id):
+            tag = soup.select_one(f"#{em_id}")
+            if tag:
+                text = tag.text.strip().replace(",", "")
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+            return None
+
+        per = extract_value("_per")
+        pbr = extract_value("_pbr")
+        eps = extract_value("_eps")
+
+        return {"PER": per, "PBR": pbr, "EPS": eps, "DIV": None}
+    except Exception:
+        return {"PER": None, "PBR": None, "EPS": None, "DIV": None}
 
 fundamental = get_fundamental(ticker, last_trading_day)
 
@@ -354,4 +392,4 @@ with st.expander("📋 최근 10일 상세 데이터 보기"):
 # 14. 하단 안내문
 # ==========================================================
 st.markdown("---")
-st.caption("데이터 출처: KRX, FinanceDataReader, pykrx (지연 가능성 있음) · 본 정보는 투자 참고용으로만 활용하시기 바랍니다.")
+st.caption("데이터 출처: 네이버 금융, FinanceDataReader, pykrx (지연 가능성 있음) · 본 정보는 투자 참고용으로만 활용하시기 바랍니다.")
