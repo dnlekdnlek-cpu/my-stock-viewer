@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import FinanceDataReader as fdr
 from pykrx import stock
+import requests
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
@@ -45,7 +46,18 @@ else:
     st.sidebar.info(f"🔴 장 마감 · 마감 데이터 고정 표시 ({now.strftime('%H:%M:%S')})")
 
 # ==========================================================
-# 2. 최근 거래일 구하기 (휴장일 대비)
+# 2. KRX 요청 공통 헤더 (차단 우회용)
+# ==========================================================
+KRX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+# ==========================================================
+# 3. 최근 거래일 구하기 (휴장일 대비)
 # ==========================================================
 def get_last_trading_day():
     d = now
@@ -63,11 +75,32 @@ def get_last_trading_day():
 last_trading_day = get_last_trading_day()
 
 # ==========================================================
-# 3. 종목 리스트 (검색용) - pykrx 우선, FDR 백업, 하루 캐시
+# 4. 종목 리스트 (검색용) - KRX 직접 요청 우선, pykrx 백업, 하루 캐시
 # ==========================================================
 @st.cache_data(ttl=60 * 60 * 24)
 def load_stock_list():
-    # 1차 시도: pykrx
+    # 1차 시도: KRX 서버에 직접 HTTP 요청 (헤더 위장)
+    try:
+        url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01901",
+            "mktId": "ALL",
+            "share": "1",
+            "csvxls_isNo": "false",
+        }
+        res = requests.post(url, headers=KRX_HEADERS, data=payload, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        rows = data.get("OutBlock_1", [])
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"ISU_SRT_CD": "Code", "ISU_ABBRV": "Name"})
+        df = df[["Code", "Name"]].dropna()
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # 2차 시도(백업): pykrx
     try:
         tickers_kospi = stock.get_market_ticker_list(market="KOSPI")
         tickers_kosdaq = stock.get_market_ticker_list(market="KOSDAQ")
@@ -80,14 +113,13 @@ def load_stock_list():
                 names.append({"Code": code, "Name": name})
             except Exception:
                 continue
-
         df = pd.DataFrame(names)
         if not df.empty:
             return df
     except Exception:
         pass
 
-    # 2차 시도(백업): FinanceDataReader
+    # 3차 시도(최종 백업): FinanceDataReader
     try:
         df = fdr.StockListing('KRX')
         df = df[['Code', 'Name']].dropna()
@@ -104,7 +136,7 @@ if stock_list.empty:
 name_to_code = dict(zip(stock_list['Name'], stock_list['Code']))
 
 # ==========================================================
-# 4. 인기 종목 TOP10 (거래대금 기준) - 장중만 실시간, 마감후 고정
+# 5. 인기 종목 TOP10 (거래대금 기준) - 장중만 실시간, 마감후 고정
 # ==========================================================
 def fetch_top10():
     try:
@@ -139,7 +171,7 @@ else:
         st.session_state.frozen_top10 = top10_df
 
 # ==========================================================
-# 5. 사이드바 - 인기 종목 TOP10 표시
+# 6. 사이드바 - 인기 종목 TOP10 표시
 # ==========================================================
 st.sidebar.header("🔥 실시간 인기 종목 TOP 10")
 st.sidebar.caption("거래대금 기준")
@@ -154,7 +186,7 @@ else:
     st.sidebar.warning("인기 종목 데이터를 불러오지 못했습니다.")
 
 # ==========================================================
-# 6. 종목 검색창
+# 7. 종목 검색창
 # ==========================================================
 st.subheader("🔍 종목 검색")
 default_value = selected_from_sidebar if selected_from_sidebar else ""
@@ -175,7 +207,7 @@ ticker = name_to_code[search_name]
 st.markdown(f"### {search_name} ({ticker})")
 
 # ==========================================================
-# 7. 시세 데이터 가져오기 (실시간/고정 로직)
+# 8. 시세 데이터 가져오기 (실시간/고정 로직)
 # ==========================================================
 def fetch_ohlcv(ticker):
     start_date = (now - timedelta(days=200)).strftime('%Y-%m-%d')
@@ -204,7 +236,7 @@ if df is None or df.empty:
     st.stop()
 
 # ==========================================================
-# 8. 기술적 지표 계산
+# 9. 기술적 지표 계산
 # ==========================================================
 def calc_moving_averages(df):
     df['MA5'] = df['Close'].rolling(5).mean()
@@ -235,7 +267,7 @@ df = calc_rsi(df)
 df = calc_macd(df)
 
 # ==========================================================
-# 9. 투자 지표 (PER, PBR, EPS, 배당수익률)
+# 10. 투자 지표 (PER, PBR, EPS, 배당수익률)
 # ==========================================================
 @st.cache_data(ttl=60 * 30)
 def get_fundamental(ticker, date):
@@ -256,7 +288,7 @@ def get_fundamental(ticker, date):
 fundamental = get_fundamental(ticker, last_trading_day)
 
 # ==========================================================
-# 10. 현재가 / 등락률 요약
+# 11. 현재가 / 등락률 요약
 # ==========================================================
 last_row = df.iloc[-1]
 prev_close = df.iloc[-2]['Close'] if len(df) > 1 else last_row['Close']
@@ -272,7 +304,7 @@ col5.metric("배당수익률", f"{fundamental['DIV']:.2f}%" if fundamental['DIV'
 col6.metric("RSI(14)", f"{last_row['RSI']:.1f}" if not pd.isna(last_row['RSI']) else "N/A")
 
 # ==========================================================
-# 11. 캔들차트 + MA + RSI + MACD (Plotly)
+# 12. 캔들차트 + MA + RSI + MACD (Plotly)
 # ==========================================================
 fig = make_subplots(
     rows=3, cols=1, shared_xaxes=True,
@@ -310,7 +342,7 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================================
-# 12. 하단 데이터 테이블 (최근 10일)
+# 13. 하단 데이터 테이블 (최근 10일)
 # ==========================================================
 with st.expander("📋 최근 10일 상세 데이터 보기"):
     st.dataframe(
@@ -319,7 +351,7 @@ with st.expander("📋 최근 10일 상세 데이터 보기"):
     )
 
 # ==========================================================
-# 13. 하단 안내문
+# 14. 하단 안내문
 # ==========================================================
 st.markdown("---")
-st.caption("데이터 출처: FinanceDataReader, pykrx (지연 가능성 있음) · 본 정보는 투자 참고용으로만 활용하시기 바랍니다.")
+st.caption("데이터 출처: KRX, FinanceDataReader, pykrx (지연 가능성 있음) · 본 정보는 투자 참고용으로만 활용하시기 바랍니다.")
