@@ -31,7 +31,6 @@ market_close = dtime(15, 30)
 is_weekday = now.weekday() < 5
 is_market_open = is_weekday and market_open <= current_time <= market_close
 
-# 세션 상태 초기화
 if "frozen_data" not in st.session_state:
     st.session_state.frozen_data = {}
 if "frozen_top10" not in st.session_state:
@@ -39,7 +38,6 @@ if "frozen_top10" not in st.session_state:
 if "frozen_top10_date" not in st.session_state:
     st.session_state.frozen_top10_date = None
 
-# 장중이면 30초마다 자동 새로고침
 if is_market_open:
     st_autorefresh(interval=30 * 1000, key="datarefresh")
     st.sidebar.success(f"🟢 실시간 갱신 중 ({now.strftime('%H:%M:%S')})")
@@ -47,7 +45,7 @@ else:
     st.sidebar.info(f"🔴 장 마감 · 마감 데이터 고정 표시 ({now.strftime('%H:%M:%S')})")
 
 # ==========================================================
-# 2. 공통 요청 헤더 (차단 우회용)
+# 2. 공통 요청 헤더
 # ==========================================================
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,7 +56,7 @@ COMMON_HEADERS = {
 }
 
 # ==========================================================
-# 3. 최근 거래일 구하기 (휴장일 대비)
+# 3. 최근 거래일 구하기
 # ==========================================================
 def get_last_trading_day():
     d = now
@@ -76,13 +74,11 @@ def get_last_trading_day():
 last_trading_day = get_last_trading_day()
 
 # ==========================================================
-# 4. 종목 리스트 (검색용) - 네이버 금융 크롤링 우선, pykrx 백업, 하루 캐시
+# 4. 종목 리스트 (검색용) - 네이버 크롤링 우선, pykrx/fdr 백업
 # ==========================================================
 @st.cache_data(ttl=60 * 60 * 24)
 def load_stock_list():
     all_rows = []
-
-    # 1차 시도: 네이버 금융 시세 페이지 크롤링 (0: 코스피, 1: 코스닥)
     try:
         for sosok in [0, 1]:
             page = 1
@@ -92,33 +88,27 @@ def load_stock_list():
                 res.raise_for_status()
                 soup = BeautifulSoup(res.text, "html.parser")
                 links = soup.select("a.tltle")
-
                 if not links:
                     break
-
                 for l in links:
                     href = l.get("href", "")
                     if "code=" in href:
                         code = href.split("code=")[-1]
                         name = l.text.strip()
                         all_rows.append({"Code": code, "Name": name})
-
                 page += 1
-                if page > 40:  # 안전장치 (무한루프 방지)
+                if page > 40:
                     break
-
         df = pd.DataFrame(all_rows).drop_duplicates(subset="Code")
         if not df.empty:
             return df
     except Exception:
         pass
 
-    # 2차 시도(백업): pykrx
     try:
         tickers_kospi = stock.get_market_ticker_list(market="KOSPI")
         tickers_kosdaq = stock.get_market_ticker_list(market="KOSDAQ")
         all_tickers = tickers_kospi + tickers_kosdaq
-
         names = []
         for code in all_tickers:
             try:
@@ -132,7 +122,6 @@ def load_stock_list():
     except Exception:
         pass
 
-    # 3차 시도(최종 백업): FinanceDataReader
     try:
         df = fdr.StockListing('KRX')
         df = df[['Code', 'Name']].dropna()
@@ -149,9 +138,11 @@ if stock_list.empty:
 name_to_code = dict(zip(stock_list['Name'], stock_list['Code']))
 
 # ==========================================================
-# 5. 인기 종목 TOP10 (거래대금 기준) - 장중만 실시간, 마감후 고정
+# 5. 인기 종목 TOP10 (거래대금 기준) - pykrx 우선, 네이버 백업
 # ==========================================================
+@st.cache_data(ttl=25)
 def fetch_top10():
+    # 1차: pykrx
     try:
         df = stock.get_market_ohlcv_by_ticker(last_trading_day, market="ALL")
         df = df.sort_values(by="거래대금", ascending=False).head(10)
@@ -168,7 +159,60 @@ def fetch_top10():
                 "등락률": df.loc[code, "등락률"],
                 "거래대금": df.loc[code, "거래대금"]
             })
-        return pd.DataFrame(result)
+        res_df = pd.DataFrame(result)
+        if not res_df.empty:
+            return res_df
+    except Exception:
+        pass
+
+    # 2차 백업: 네이버 금융 시세 페이지 크롤링 (거래대금 기준 정렬)
+    try:
+        collected = []
+        for sosok in [0, 1]:
+            for page in range(1, 6):  # 상위 250개 종목권 내에서 탐색
+                url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+                res = requests.get(url, headers=COMMON_HEADERS, timeout=10)
+                res.raise_for_status()
+                tables = pd.read_html(res.text, encoding="euc-kr")
+                table = tables[1].dropna(subset=["종목명"]).reset_index(drop=True)
+                if table.empty:
+                    break
+
+                soup = BeautifulSoup(res.text, "html.parser")
+                links = soup.select("a.tltle")
+                codes = [l["href"].split("code=")[-1] for l in links]
+
+                n = min(len(table), len(codes))
+                table = table.iloc[:n].copy()
+                table["코드"] = codes[:n]
+                collected.append(table)
+
+        if not collected:
+            return pd.DataFrame(columns=["코드", "종목명", "종가", "등락률", "거래대금"])
+
+        full = pd.concat(collected, ignore_index=True)
+
+        full["거래대금_num"] = pd.to_numeric(
+            full["거래대금"].astype(str).str.replace(",", ""), errors="coerce"
+        )
+        full = full.dropna(subset=["거래대금_num"])
+        full = full.sort_values("거래대금_num", ascending=False).head(10)
+
+        full["등락률_num"] = (
+            full["등락률"].astype(str)
+            .str.replace("%", "")
+            .str.replace("+", "")
+            .astype(float)
+        )
+
+        out = pd.DataFrame({
+            "코드": full["코드"].values,
+            "종목명": full["종목명"].values,
+            "종가": full["현재가"].values,
+            "등락률": full["등락률_num"].values,
+            "거래대금": full["거래대금_num"].values,
+        })
+        return out
     except Exception:
         return pd.DataFrame(columns=["코드", "종목명", "종가", "등락률", "거래대금"])
 
@@ -220,7 +264,7 @@ ticker = name_to_code[search_name]
 st.markdown(f"### {search_name} ({ticker})")
 
 # ==========================================================
-# 8. 시세 데이터 가져오기 (실시간/고정 로직)
+# 8. 시세 데이터 가져오기
 # ==========================================================
 def fetch_ohlcv(ticker):
     start_date = (now - timedelta(days=200)).strftime('%Y-%m-%d')
@@ -282,6 +326,22 @@ df = calc_macd(df)
 # ==========================================================
 # 10. 투자 지표 (PER, PBR, EPS, 배당수익률)
 # ==========================================================
+def extract_naver_dividend(soup):
+    """네이버 종목 페이지의 '배당수익률' 행을 텍스트 매칭으로 탐색"""
+    try:
+        for th in soup.find_all("th"):
+            if "배당수익률" in th.get_text():
+                td = th.find_next("td")
+                if td:
+                    em = td.find("em")
+                    raw = (em.get_text() if em else td.get_text()).strip()
+                    raw = raw.replace("%", "").replace(",", "")
+                    if raw and raw not in ["-", "N/A", "N/A%"]:
+                        return float(raw)
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(ttl=60 * 30)
 def get_fundamental(ticker, date):
     # 1차: pykrx
@@ -289,10 +349,8 @@ def get_fundamental(ticker, date):
         fdf = stock.get_market_fundamental_by_ticker(date, market="ALL")
         if ticker in fdf.index:
             row = fdf.loc[ticker]
-            per = row.get("PER", None)
-            pbr = row.get("PBR", None)
-            eps = row.get("EPS", None)
-            div = row.get("DIV", None)
+            per, pbr = row.get("PER", None), row.get("PBR", None)
+            eps, div = row.get("EPS", None), row.get("DIV", None)
             if per or pbr or eps or div:
                 return {"PER": per, "PBR": pbr, "EPS": eps, "DIV": div}
     except Exception:
@@ -305,21 +363,22 @@ def get_fundamental(ticker, date):
         res.raise_for_status()
         soup = BeautifulSoup(res.text, "html.parser")
 
-        def extract_value(em_id):
+        def extract_by_id(em_id):
             tag = soup.select_one(f"#{em_id}")
             if tag:
-                text = tag.text.strip().replace(",", "")
+                text = tag.get_text().strip().replace(",", "")
                 try:
                     return float(text)
                 except ValueError:
                     return None
             return None
 
-        per = extract_value("_per")
-        pbr = extract_value("_pbr")
-        eps = extract_value("_eps")
+        per = extract_by_id("_per")
+        pbr = extract_by_id("_pbr")
+        eps = extract_by_id("_eps")
+        div = extract_naver_dividend(soup)
 
-        return {"PER": per, "PBR": pbr, "EPS": eps, "DIV": None}
+        return {"PER": per, "PBR": pbr, "EPS": eps, "DIV": div}
     except Exception:
         return {"PER": None, "PBR": None, "EPS": None, "DIV": None}
 
@@ -342,7 +401,7 @@ col5.metric("배당수익률", f"{fundamental['DIV']:.2f}%" if fundamental['DIV'
 col6.metric("RSI(14)", f"{last_row['RSI']:.1f}" if not pd.isna(last_row['RSI']) else "N/A")
 
 # ==========================================================
-# 12. 캔들차트 + MA + RSI + MACD (Plotly)
+# 12. 캔들차트 + MA + RSI + MACD
 # ==========================================================
 fig = make_subplots(
     rows=3, cols=1, shared_xaxes=True,
@@ -380,7 +439,7 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================================
-# 13. 하단 데이터 테이블 (최근 10일)
+# 13. 하단 데이터 테이블
 # ==========================================================
 with st.expander("📋 최근 10일 상세 데이터 보기"):
     st.dataframe(
