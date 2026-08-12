@@ -138,7 +138,9 @@ if stock_list.empty:
 name_to_code = dict(zip(stock_list['Name'], stock_list['Code']))
 
 # ==========================================================
-# 5. 인기 종목 TOP10 (거래대금 기준) - pykrx 우선, 네이버 백업
+# 5. 인기 종목 TOP10 (거래대금 기준)
+#    - 1차: pykrx
+#    - 2차: 네이버 "거래대금 상위" 전용 페이지 (이미 정렬되어 있음)
 # ==========================================================
 @st.cache_data(ttl=25)
 def fetch_top10():
@@ -165,54 +167,57 @@ def fetch_top10():
     except Exception:
         pass
 
-    # 2차 백업: 네이버 금융 시세 페이지 크롤링 (거래대금 기준 정렬)
+    # 2차 백업: 네이버 "거래대금 상위" 전용 페이지 크롤링
     try:
-        collected = []
-        for sosok in [0, 1]:
-            for page in range(1, 6):  # 상위 250개 종목권 내에서 탐색
-                url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
-                res = requests.get(url, headers=COMMON_HEADERS, timeout=10)
-                res.raise_for_status()
-                tables = pd.read_html(res.text, encoding="euc-kr")
-                table = tables[1].dropna(subset=["종목명"]).reset_index(drop=True)
-                if table.empty:
-                    break
+        url = "https://finance.naver.com/sise/sise_quant.naver"
+        res = requests.get(url, headers=COMMON_HEADERS, timeout=10)
+        res.raise_for_status()
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
 
-                soup = BeautifulSoup(res.text, "html.parser")
-                links = soup.select("a.tltle")
-                codes = [l["href"].split("code=")[-1] for l in links]
-
-                n = min(len(table), len(codes))
-                table = table.iloc[:n].copy()
-                table["코드"] = codes[:n]
-                collected.append(table)
-
-        if not collected:
+        table = soup.select_one("table.type_2")
+        if table is None:
             return pd.DataFrame(columns=["코드", "종목명", "종가", "등락률", "거래대금"])
 
-        full = pd.concat(collected, ignore_index=True)
+        rows = table.select("tr")
+        results = []
 
-        full["거래대금_num"] = pd.to_numeric(
-            full["거래대금"].astype(str).str.replace(",", ""), errors="coerce"
-        )
-        full = full.dropna(subset=["거래대금_num"])
-        full = full.sort_values("거래대금_num", ascending=False).head(10)
+        for tr in rows:
+            link = tr.select_one("a.tltle")
+            if not link:
+                continue
 
-        full["등락률_num"] = (
-            full["등락률"].astype(str)
-            .str.replace("%", "")
-            .str.replace("+", "")
-            .astype(float)
-        )
+            href = link.get("href", "")
+            if "code=" not in href:
+                continue
 
-        out = pd.DataFrame({
-            "코드": full["코드"].values,
-            "종목명": full["종목명"].values,
-            "종가": full["현재가"].values,
-            "등락률": full["등락률_num"].values,
-            "거래대금": full["거래대금_num"].values,
-        })
-        return out
+            code = href.split("code=")[-1]
+            name = link.text.strip()
+            tds = tr.select("td")
+
+            try:
+                price_text = tds[2].get_text(strip=True).replace(",", "")
+                pct_text = (
+                    tds[4].get_text(strip=True)
+                    .replace("%", "")
+                    .replace("+", "")
+                )
+                trade_value_text = tds[6].get_text(strip=True).replace(",", "")
+
+                results.append({
+                    "코드": code,
+                    "종목명": name,
+                    "종가": float(price_text) if price_text else 0.0,
+                    "등락률": float(pct_text) if pct_text not in ["", "-"] else 0.0,
+                    "거래대금": float(trade_value_text) if trade_value_text else 0.0,
+                })
+            except Exception:
+                continue
+
+            if len(results) >= 10:
+                break
+
+        return pd.DataFrame(results)
     except Exception:
         return pd.DataFrame(columns=["코드", "종목명", "종가", "등락률", "거래대금"])
 
@@ -327,7 +332,6 @@ df = calc_macd(df)
 # 10. 투자 지표 (PER, PBR, EPS, 배당수익률)
 # ==========================================================
 def extract_naver_dividend(soup):
-    """네이버 종목 페이지의 '배당수익률' 행을 텍스트 매칭으로 탐색"""
     try:
         for th in soup.find_all("th"):
             if "배당수익률" in th.get_text():
@@ -344,7 +348,6 @@ def extract_naver_dividend(soup):
 
 @st.cache_data(ttl=60 * 30)
 def get_fundamental(ticker, date):
-    # 1차: pykrx
     try:
         fdf = stock.get_market_fundamental_by_ticker(date, market="ALL")
         if ticker in fdf.index:
@@ -356,7 +359,6 @@ def get_fundamental(ticker, date):
     except Exception:
         pass
 
-    # 2차 백업: 네이버 금융 종목 페이지 크롤링
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
         res = requests.get(url, headers=COMMON_HEADERS, timeout=10)
